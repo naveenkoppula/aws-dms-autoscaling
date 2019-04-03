@@ -8,6 +8,7 @@ import random
 import time
 import os
 
+
 events_client = boto3.client('events')
 cloudwatch = boto3.client('cloudwatch')
 lambda_client = boto3.client('lambda')
@@ -132,9 +133,10 @@ def delete_cloudwatch_event(event):
     print('Response to delete cloudwatch scheduled event: ', rule_name , ' is: ', response)
 
 
-def get_next_instance_class(existing_instance_class, scale_type):
-    """Return the next higher/lower instance type to which the instance will be modified.
-    scale_type: cpu_high, cpu_low, memory_high, memory_low
+def get_update_on_instance(existing_value, scale_type):
+    """Return the next higher/lower instance type to which the instance will be modified
+        Or Returns updated Allocated Storage.
+    scale_type: cpu_high, cpu_low, memory_high, memory_low, storage_high
     """
 
     ######### Get the json resource file from bucket ##########
@@ -149,31 +151,35 @@ def get_next_instance_class(existing_instance_class, scale_type):
         KEY_NAME = os.environ['KEY_NAME']
     except:
         KEY_NAME = 'artifacts/auto_scale_DMS_replication_instance/instance_types.json'  # name of the json file
-    
     obj = s3_client.Object(BUCKET_NAME, KEY_NAME)
     
-    instance_types = json.loads(obj.get()['Body'].read().decode('utf-8'))
+    config = json.loads(obj.get()['Body'].read().decode('utf-8'))
+    
+
     file_path = 's3://' + BUCKET_NAME + '/' + KEY_NAME
     ######### Got the json resource file from bucket ##########
 
     ## If autoscaling up or down is disabled in json resource file then quit ###
-    autoscaling_up_enabled = instance_types['autoscaling_up_enabled']
-    autoscaling_down_enabled = instance_types['autoscaling_down_enabled']
+    autoscaling_up_enabled = config['autoscaling_up_enabled']
+    autoscaling_down_enabled = config['autoscaling_down_enabled']
+    storage_percentage = config.get('storage_change_percentage',10)
 
-    if (scale_type == 'cpu_high' or scale_type == 'memory_high') and autoscaling_up_enabled == 'false':
+    if scale_type in ('cpu_high', 'memory_high', 'storage_high') and autoscaling_up_enabled == 'false':
         print('Autoscaling UP is disabled in:' + file_path + '. Quitting now.. Bye!!!')
         return
-    elif (scale_type == 'cpu_low' or scale_type == 'memory_low') and autoscaling_down_enabled == 'false':
+    elif scale_type in ('cpu_low', 'memory_low') and autoscaling_down_enabled == 'false':
         print('Autoscaling DOWN is disabled in:' + file_path + '. Quitting now.. Bye!!!')
         return
     ###### resource file autoscaling configration check complete ######
 
-    next_instance_type = instance_types[existing_instance_class][scale_type]
-    
-    print('existing_instance_type: ', existing_instance_class, ', next_instance_type: ', next_instance_type)
-
+    if scale_type == 'storage_high':
+        next_storage = int(eval('%s%s%s'%(existing_value, '+' if scale_type == 'storage_high' else '-', existing_value/100*storage_percentage)))
+        print('existing_allocated_storage: ', existing_value, ', next_allocated_storage: ', next_storage)
+        return next_storage
+    next_instance_type = config[existing_value][scale_type]    
+    print('existing_instance_type: ', existing_value, ', next_instance_type: ', next_instance_type)
     if next_instance_type == 'no_action':
-        print('Not taking action for :', existing_instance_class, ' for :', scale_type , ' as defined in: ', file_path)
+        print('Not taking action for :', existing_value, ' for :', scale_type , ' as defined in: ', file_path)
         return 'no_action'    
     return next_instance_type
 
@@ -219,31 +225,48 @@ def dms_event_handler(event, context):
     replication_instance_arn = replication_instance_details['ReplicationInstanceArn']
     replication_instance_class = replication_instance_details['ReplicationInstanceClass']
     replication_instance_status = replication_instance_details['ReplicationInstanceStatus']
+    replication_instance_storage = replication_instance_details['AllocatedStorage']
 
     # if for whatever reason instance is not in available statet then quit.
     if replication_instance_status != 'available':
         print('Instance status must be available to make changes to it. Current status of instance: ',
               replication_instance_details['ReplicationInstanceIdentifier'], ' is: ', replication_instance_status)
         return 0
+    
+    params = {
+        "ReplicationInstanceArn": replication_instance_arn,
+        "ApplyImmediately": True
+    }
+    if event["Trigger"]["MetricName"] == 'FreeStorageSpace':
+        if event['Trigger']['ComparisonOperator'] in ['GreaterThanOrEqualToThreshold', 'GreaterThanThreshold']:
+            print("Cannot down scale storage")
+            return 0
+        event_type = 'storage_high'
+        params['AllocatedStorage'] = get_update_on_instance(
+            replication_instance_storage,
+            event_type
+        )
+    elif event["Trigger"]["MetricName"] == 'CPUUtilization':
+        # get scale type cpu-high/cpu-low. e.g. dms-cpu-high
+        #event_type = alarm_name[4:len(alarm_name)]  # form dms-cpu-high it returns cpu-high
+        event_type = 'cpu_high' if event['Trigger']['ComparisonOperator'] in ['GreaterThanOrEqualToThreshold', 'GreaterThanThreshold'] else 'cpu_low'
+    
+        # Get the next higher instance class
+        next_instance_type = get_update_on_instance(
+            replication_instance_class,
+            event_type
+        )
 
-    # get scale type cpu-high/cpu-low. e.g. dms-cpu-high
-    event_type = alarm_name[4:len(alarm_name)]  # form dms-cpu-high it returns cpu-high
-
-    # Get the next higher instance class
-    next_instance_type = get_next_instance_class(replication_instance_class, event_type)
-
-    if next_instance_type == 'no_action':  # next_instance_type will be no_action if up/down scaling is not possible
-        print('Cannot up/down scale as per config file in S3')
-        return 0
+        if next_instance_type == 'no_action':  # next_instance_type will be no_action if up/down scaling is not possible
+            print('Cannot up/down scale as per config file in S3')
+            return 0
+        params['ReplicationInstanceClass'] = next_instance_type
+        
     
     replication_tasks = shorten_replication_tasks(get_replication_tasks(replication_instance_arn))
     
     # Upgrade/Downgrade the instance to next higher/lower instance class
-    dms_client.modify_replication_instance(
-        ReplicationInstanceArn=replication_instance_arn,
-        ApplyImmediately=True,
-        ReplicationInstanceClass=next_instance_type
-    )
+    dms_client.modify_replication_instance(**params)
 
     send_sns("Instance modification started: " + replication_instance_name, 
     "Instance modification started: " + replication_instance_name)
@@ -328,22 +351,19 @@ def scheduled_event_handler(event):
 def lambda_handler(event, context):
     # Find the type of event scheduled or dms
     dms_alarms = ['dms_cpu_high', 'dms_cpu_low', 'dms_memory_high', 'dms_memory_low']
-    
+    available_metrics = ['CPUUtilization', 'FreeStorageSpace']
     message = ''
-    
     try:
         # if event is from SNS then we need to convert the message from text to json
         message = json.loads(event["Records"][0]["Sns"]["Message"])
-    except:
+    except :
         # if message is not from SNS then its from scheduled cloudwatch event and we process it directly
         message = event
-    
     if "replication_instance" in message:
         print("------cloudwatch scheduled event------")
         scheduled_event_handler(message)
-    elif message["AlarmName"] in dms_alarms:
+    elif message["AlarmName"] and message["Trigger"]["MetricName"] in available_metrics:
         print("------dms event: ", message["AlarmName"] ," -------")
         dms_event_handler(message, context)
 
     return 0
-

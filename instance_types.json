@@ -2,6 +2,7 @@
     "version": "2.4.2",
     "autoscaling_up_enabled": "true",
     "autoscaling_down_enabled": "true",
+	"storage_change_percentage": 20,
     "timeout": 10,
     "dms.t2.micro": {
         "cpu_high": "dms.t2.small",
