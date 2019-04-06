@@ -351,7 +351,7 @@ def scheduled_event_handler(event):
 def lambda_handler(event, context):
     # Find the type of event scheduled or dms
     dms_alarms = ['dms_cpu_high', 'dms_cpu_low', 'dms_memory_high', 'dms_memory_low']
-    available_metrics = ['CPUUtilization', 'FreeStorageSpace']
+    available_metrics = ['CPUUtilization', 'FreeStorageSpace', 'FreeableMemory']
     message = ''
     try:
         # if event is from SNS then we need to convert the message from text to json
